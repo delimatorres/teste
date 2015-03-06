@@ -1,10 +1,25 @@
 import multiprocessing
 import time
+import signal
+import requests
 
 from tabulate import tabulate
 from collections import Counter
 
 from utils import get_api_items
+
+API_URL = 'https://api.lifesum.com/v1/foodipedia/foodstats'
+DEFAULT_HEADERS = {'User-Agent': 'LifesumFoodbasket'}
+NEXT_OFFSET = 658330804
+LIMIT_PER_PAGE = 100
+TIMEOUT_DEFAULT = 10
+DEFAULT_WAIT_TIMEOUT = 15
+LIFESUM_START_OFFSET = 658330693
+LIFESUM_MAX_OFFSET = 732158492
+LIFESUM_TOTAL = LIFESUM_MAX_OFFSET - LIFESUM_START_OFFSET
+NUM_WORKRS = multiprocessing.cpu_count()
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 class FoodBasket(object):
@@ -31,55 +46,63 @@ class FoodBasket(object):
         return (grid_food, grid_category)
 
 
-class Worker(multiprocessing.Process):
-    def __init__(self, task_queue, result_queue, start_offset):
+class ConsumerProcess(multiprocessing.Process):
+    def __init__(self, queue):
         multiprocessing.Process.__init__(self)
-        self.task_queue = task_queue
-        self.result_queue = result_queue
-        self.start_offset = start_offset
-        self.interrupt = False
+        self.queue = queue
+        self.start()
 
     def run(self):
-        process_name = self.name
-        try:
-            while True:
-                pass
-                next_task = self.task_queue.get()
-                if next_task is None:
-                    # Poison pill means shutdown
-                    print '%s: Exiting' % proc_name
-                    self.task_queue.task_done()
-                    break
-                
-                answer = next_task()
-                self.task_queue.task_done()
-                self.result_queue.put(answer)
-        except KeyboardInterrupt:
-            self.task_queue.task_done()
-        finally:
-            x, y = next_task.basket.popular_food_category()
-            print x
-            print y
+        init_worker()
+        ps = []
+        for d in iter(self.queue.get, None):        
+            if(d == 'killjobs'):
+                for p in ps:
+                    p.terminate()
+            else:
+                ps.append(
+                    multiprocessing.Process(
+                        target=Task, args=(d.numerator,)
+                    )
+                )
+                ps[-1].daemon = True
+                ps[-1].start()
+
+        for p in ps:
+            p.join()
 
 
-    def get_api_items(start_offset):
+class Task(object):
+    def __init__(self, index):
+        self.basket = FoodBasket()
+        self.num_workers = NUM_WORKRS
+        self.index = index
+    
+        offset_amount = int(LIFESUM_TOTAL / self.num_workers)
+        offset = LIFESUM_START_OFFSET + (offset_amount * self.index)
+        for item in self.get_api_items(offset):
+            self.basket.update_basket(
+                {item['food_id']: 1}, {item['food__category_id']: 1}
+            )
+
+    def get_api_items(self, start_offset):
         '''
-        Generator helper que parseia a estrutra padrao do json do rest framework
-        respeitando a paginacao e iterando item a item
+        Generator helper used to parser the structures guide by the pagination
+        and iterating item to item
         '''
         next_offset = start_offset
+
         has_more = True
         
         while has_more:
-            paginated_items = get_items(limit=100, offset=next_offset)
+            paginated_items = self.get_items(limit=100, offset=next_offset)
             items = paginated_items['response']
             for item in items:
                 yield item
 
-            # has_more = next_offset = paginated_items['meta']['next_offset']
-            next_offset = paginated_items['meta']['next_offset']
+            has_more = next_offset = paginated_items['meta']['next_offset']
 
-    def get_items(**parameters):
+    def get_items(self, **parameters):
         """
         This method returns the data 
         """
@@ -92,66 +115,43 @@ class Worker(multiprocessing.Process):
         except:
             pass
         else:
+            time.sleep(1/NUM_WORKRS)
             if response.ok:
                 data = response.json()
 
         return data
 
+def run_all():
+    q = multiprocessing.Queue()
+    p = ConsumerProcess(q)
+    food_basket = FoodBasket()
 
-class Task(object):
-    def __init__(self, start_offset, food_basket):
-        self.start_offset = start_offset
-        self.basket = food_basket
+    num_workers = NUM_WORKRS
+    print 'Creating %d workers' % num_workers
 
-    def __call__(self):
-        for item in get_api_items(self.start_offset):
-            self.basket.update_basket(
-                {item['food_id']: 1}, {item['food__category_id']: 1}
-            )
+    # Establish communication queues
+    # Start workers
+    for i in xrange(num_workers):
+        q.put(i)
 
+    try:
+        while True:
+            time.sleep(1)
+        
+    except KeyboardInterrupt:
+        print "Caught KeyboardInterrupt, terminating consumer"
+        q.put('killjobs')
 
-def make_offset(worker_id, num_workers):
-    LIFESUM_START_OFFSET = 658330693
-    LIFESUM_MAX_OFFSET = 732158492
-    LIFESUM_TOTAL = LIFESUM_MAX_OFFSET - LIFESUM_START_OFFSET
-    offset_amount = int(LIFESUM_TOTAL / num_workers)
-    offset = LIFESUM_START_OFFSET + (offset_amount * worker_id)
-    return offset
+    else:
+        print "Quitting normally"
+
+    finally:
+        q.put(None)
+        q.close()
+        p.join()
+
 
 if __name__ == '__main__':
-    try:
-        # Establish communication queues
-        tasks = multiprocessing.JoinableQueue()
-        results = multiprocessing.Queue()
-        food_basket = FoodBasket()
+    run_all()
 
-        # Start workers
-        num_workers = multiprocessing.cpu_count()
-        print 'Creating %d workers' % num_workers
-        workers = [ Worker(tasks, results, make_offset(i, num_workers))
-                      for i in xrange(num_workers)]
-        for w in workers:
-            w.start()
-
-        # Enqueue jobs
-        for i in xrange(num_workers):
-            tasks.put(
-                Task(make_offset(i, num_workers), food_basket)
-            )
-
-        # Add a poison pill for each consumer
-        for i in xrange(num_workers):
-            tasks.put(0.2)
-
-        # Wait for all of the tasks to finish
-        tasks.join()
-        # Start printing results
-        while num_jobs:
-            result = results.get()
-            print 'Result:', result
-            num_jobs -= 1
-
-    except Exception, e:
-        print e
-        print "Done"
 
